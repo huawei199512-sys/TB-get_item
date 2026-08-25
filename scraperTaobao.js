@@ -322,25 +322,25 @@ async function fetchDetailOnce(itemId, cookieStr, token, proxy) {
 async function getProductDetail(itemId) {
   console.log(`[TB] 获取商品详情: ${itemId}`);
 
-  // ===== 会话初始化（纯代理模式下也走代理）=====
-  let session = null;
-  if (proxyManager.isEnabled()) {
-    session = await initSession(proxyManager.getProxy() || null);
-  } else {
-    session = await initSession(null);
-  }
+  // ===== 会话初始化（游客token + 登录cookie合并）=====
+  const session = await initSession(null);
   if (!session || !session.token) {
     console.warn('[TB] 会话初始化失败（无法获取token）');
     return generateMockDetail(itemId, '会话初始化失败');
   }
   const { cookieStr, token } = session;
 
-  // ===== 代理竞态获取详情（与京东H5方案一致）=====
+  // ===== 抓取策略：直连优先（服务器IP通常干净），代理池兜底 =====
   let detail = null;
   let proxyUsed = null;
 
-  if (proxyManager.isEnabled()) {
-    console.log('[TB] 纯代理模式: 代理竞态获取详情...');
+  // 1) 先直连（Render新加坡IP / 本机IP），成功即返回，不走劣质免费代理
+  detail = await fetchDetailOnce(itemId, cookieStr, token, null);
+  if (detail) {
+    console.log(`[TB] 详情直连成功: ${itemId}, 标题: ${detail.subject?.substring(0, 30)}, 主图: ${detail.images.length}, SKU: ${detail.skuCount}`);
+  } else if (proxyManager.isEnabled()) {
+    // 2) 直连失败（被滑块/挑战拦截）→ 代理池并发竞态兜底
+    console.log('[TB] 直连失败，开始代理竞态兜底...');
     const seenProxies = new Set();
     for (let round = 0; round < MAX_ROUNDS; round++) {
       const batch = [];
@@ -371,12 +371,6 @@ async function getProductDetail(itemId) {
       }
       if (detail) break;
     }
-  } else {
-    // 代理禁用时直连
-    detail = await fetchDetailOnce(itemId, cookieStr, token, null);
-    if (detail) {
-      console.log(`[TB] 详情直连成功: ${itemId}, 标题: ${detail.subject?.substring(0, 30)}, 主图: ${detail.images.length}, SKU: ${detail.skuCount}`);
-    }
   }
 
   if (!detail) {
@@ -384,14 +378,17 @@ async function getProductDetail(itemId) {
     return generateMockDetail(itemId, '详情接口获取失败（可能需要有效的淘宝登录Cookie）');
   }
 
-  // ===== 详情图获取 =====
-  const descProxy = proxyManager.isEnabled() ? (proxyUsed || proxyManager.getProxy() || null) : null;
-  const desc = await fetchDescImages(itemId, detail._cookieStr, detail._token, descProxy);
-  if (desc.length > 0 && descProxy && proxyManager.isEnabled()) {
-    proxyManager.markSuccess(descProxy);
+  // ===== 详情图获取（同样直连优先，代理兜底）=====
+  let desc = await fetchDescImages(itemId, detail._cookieStr, detail._token, null);
+  if (desc.length === 0 && proxyManager.isEnabled()) {
+    const descProxy = proxyUsed || proxyManager.getProxy() || null;
+    desc = await fetchDescImages(itemId, detail._cookieStr, detail._token, descProxy);
+    if (desc.length > 0 && descProxy) {
+      proxyManager.markSuccess(descProxy);
+    }
   }
   detail.desc = desc;
-  console.log(`[TB] 详情图: ${desc.length}张${descProxy ? ' (代理:' + descProxy + ')' : ''}`);
+  console.log(`[TB] 详情图: ${desc.length}张${proxyUsed ? ' (代理:' + proxyUsed + ')' : ' (直连)'}`);
 
   // ===== 清理内部字段 =====
   delete detail._token;
